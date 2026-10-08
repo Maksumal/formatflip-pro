@@ -25,6 +25,10 @@ OUTPUT_DIR = RUNTIME_DIR / "outputs"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
+# Temporary development host: protect local testing from large/concurrent uploads.
+# The threaded Waitress adapter starts lazily per request/thread; this process-local
+# counter is only for one local instance, not a cross-worker production quota.
+
 MAX_UPLOAD_BYTES = 200 * 1024 * 1024
 MAX_CONCURRENT_JOBS = 2
 FILE_TTL_SECONDS = 60 * 60
@@ -71,6 +75,20 @@ def _safe_error(text: str, limit: int = 240) -> str:
     return (lines[-1] if lines else "Conversion failed")[:limit]
 
 
+def _consume_pipe(pipe, tail: bytearray, limit: int = 2048) -> None:
+    """Drain subprocess output without buffering unbounded FFmpeg logs."""
+    try:
+        while True:
+            chunk = pipe.read(4096)
+            if not chunk:
+                break
+            tail.extend(chunk)
+            if len(tail) > limit:
+                del tail[:-limit]
+    finally:
+        pipe.close()
+
+
 def _run_conversion(source: Path, output: Path, fmt: str) -> tuple[bool, str]:
     ffmpeg = _find_ffmpeg()
     if not ffmpeg:
@@ -82,15 +100,48 @@ def _run_conversion(source: Path, output: Path, fmt: str) -> tuple[bool, str]:
         args = [ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin", "-protocol_whitelist", "file,pipe,crypto,data", "-y", "-i", str(source), "-map", "0:a:0", *codec_args, str(output)]
     else:
         args = [ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin", "-protocol_whitelist", "file,pipe,crypto,data", "-y", "-i", str(source), "-map", "0:v:0", "-map", "0:a?", *codec_args, str(output)]
+    process = None
+    stderr_tail = bytearray()
+    stderr_reader = None
     try:
-        result = subprocess.run(args, capture_output=True, text=True, timeout=CONVERSION_TIMEOUT_SECONDS, check=False)
-    except subprocess.TimeoutExpired:
-        return False, "Conversion timed out. Try a shorter or smaller file."
+        process = subprocess.Popen(
+            args,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            shell=False,
+            close_fds=True,
+        )
+        stderr_reader = threading.Thread(
+            target=_consume_pipe,
+            args=(process.stderr, stderr_tail),
+            name="formatflip-ffmpeg-stderr",
+            daemon=True,
+        )
+        stderr_reader.start()
+        try:
+            return_code = process.wait(timeout=CONVERSION_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+            stderr_reader.join(timeout=2)
+            output.unlink(missing_ok=True)
+            return False, "Conversion timed out. Try a shorter or smaller file."
+        stderr_reader.join(timeout=2)
     except OSError:
         app.logger.exception("Could not execute FFmpeg")
+        if process is not None and process.poll() is None:
+            process.kill()
+            process.wait()
+        output.unlink(missing_ok=True)
         return False, "The converter could not start."
-    if result.returncode != 0 or not output.is_file() or output.stat().st_size == 0:
-        return False, _safe_error(result.stderr)
+    if return_code != 0 or not output.is_file() or output.stat().st_size == 0:
+        try:
+            error_text = bytes(stderr_tail).decode("utf-8", errors="replace")
+        except Exception:
+            error_text = "Conversion failed"
+        output.unlink(missing_ok=True)
+        return False, _safe_error(error_text)
     return True, ""
 
 
@@ -98,6 +149,12 @@ def _cleanup_worker() -> None:
     while True:
         time.sleep(300)
         cutoff = time.time() - FILE_TTL_SECONDS
+        for folder in (UPLOAD_DIR, OUTPUT_DIR):
+            try:
+                folder.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                app.logger.warning("Could not recreate temporary folder")
+                continue
         with jobs_lock:
             expired_paths = [Path(value["output_path"]) for value in jobs.values()
                              if value.get("status") == "completed"
@@ -106,16 +163,60 @@ def _cleanup_worker() -> None:
             expired_ids = [key for key, value in jobs.items()
                            if value.get("status") != "processing"
                            and value.get("created_at", 0) < cutoff]
+            output_paths_in_use = {
+                value.get("output_path") for value in jobs.values()
+                if value.get("status") == "completed" and value.get("output_path")
+                and value.get("created_at", 0) >= cutoff
+            }
+            known_output_paths = {
+                str(Path(value["output_path"])) for value in jobs.values()
+                if value.get("output_path")
+            }
+            orphan_paths = [item for item in OUTPUT_DIR.iterdir()
+                            if item.is_file()
+                            and item.stat().st_mtime < cutoff
+                            and str(item) not in known_output_paths]
+            expired_paths = [path for path in expired_paths
+                             if str(path) not in output_paths_in_use]
+            expired_paths.extend(orphan_paths)
             for job_id in expired_ids:
                 jobs.pop(job_id, None)
         for path in expired_paths:
             try:
                 path.unlink(missing_ok=True)
+            except FileNotFoundError:
+                pass
             except OSError:
                 app.logger.warning("Could not remove expired result")
 
 
-threading.Thread(target=_cleanup_worker, name="formatflip-cleanup", daemon=True).start()
+_cleanup_thread = None
+_cleanup_thread_lock = threading.Lock()
+
+
+def _ensure_cleanup_thread() -> None:
+    """Start exactly one cleanup worker per Python process, lazily on first request."""
+    global _cleanup_thread
+    with _cleanup_thread_lock:
+        if _cleanup_thread is None or not _cleanup_thread.is_alive():
+            _cleanup_thread = threading.Thread(
+                target=_cleanup_worker,
+                name="formatflip-cleanup",
+                daemon=True,
+            )
+            _cleanup_thread.start()
+
+
+@app.before_request
+def ensure_temp_dirs_and_cleanup():
+    try:
+        UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        app.logger.exception("Could not prepare temp folders")
+        return jsonify({"error": "Temporary storage is unavailable."}), 503
+    _ensure_cleanup_thread()
+    return None
 
 
 @app.errorhandler(RequestEntityTooLarge)
