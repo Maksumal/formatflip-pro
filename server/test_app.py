@@ -17,9 +17,9 @@ class FormatFlipTests(unittest.TestCase):
         self.client = appmod.app.test_client()
 
     def test_home_serves_real_landing_page(self):
-        response = self.client.get("/")
-        self.assertEqual(response.status_code, 200)
-        self.assertIn(b"FormatFlip", response.data)
+        with self.client.get("/") as response:
+            self.assertEqual(response.status_code, 200)
+            self.assertIn(b"FormatFlip", response.data)
 
     def test_health_reports_ffmpeg(self):
         response = self.client.get("/health")
@@ -55,9 +55,9 @@ class FormatFlipTests(unittest.TestCase):
             self.assertEqual(response.status_code, 200, response.get_data(as_text=True))
             job_id = response.get_json()["job_id"]
             self.assertEqual(self.client.get(f"/api/status/{job_id}").get_json()["status"], "completed")
-            download = self.client.get(f"/download/{job_id}")
-            self.assertEqual(download.status_code, 200)
-            self.assertTrue(download.data.startswith(b"ID3") or download.data[:2] == b"\xff\xfb")
+            with self.client.get(f"/download/{job_id}") as download:
+                self.assertEqual(download.status_code, 200)
+                self.assertTrue(download.data.startswith(b"ID3") or download.data[:2] == b"\xff\xfb")
             self.assertTrue(appmod.jobs[job_id]["output_path"])
         finally:
             sample.unlink(missing_ok=True)
