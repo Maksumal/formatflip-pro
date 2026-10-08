@@ -3,8 +3,10 @@ services:
     name: formatflip-pro
     runtime: docker
     plan: free
+    region: oregon
     dockerfilePath: ./Dockerfile
     dockerContext: .
+    dockerCommand: "sh -c 'exec waitress-serve --listen=0.0.0.0:${PORT:-10000} --threads=4 server.app:app'"
     healthCheckPath: /health
     envVars:
       - key: PUBLIC_BIND
