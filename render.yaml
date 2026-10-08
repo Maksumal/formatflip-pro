@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: formatflip-pro
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /health
+    envVars:
+      - key: PUBLIC_BIND
+        value: "1"
