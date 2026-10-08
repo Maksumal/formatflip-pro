@@ -7,4 +7,10 @@ if not exist ".venv\Scripts\python.exe" (
   exit /b 1
 )
 .venv\Scripts\python.exe server\test_app.py
+if errorlevel 1 (
+  echo Tests failed.
+  pause
+  exit /b 1
+)
+echo All tests passed.
 pause
