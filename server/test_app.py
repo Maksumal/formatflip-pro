@@ -43,6 +43,45 @@ class FormatFlipTests(unittest.TestCase):
         response = self.client.post("/api/convert", data={"output_format":"mp3", "file":(io.BytesIO(b"x"),"clip.exe")}, content_type="multipart/form-data")
         self.assertEqual(response.status_code, 415)
 
+    def test_image_formats_only_advertise_installed_codecs(self):
+        data = self.client.get("/api/formats").get_json()
+        self.assertEqual(set(data["image_to_image"]), set(appmod.IMAGE_PRESETS))
+        self.assertIn("png", data["image_to_image"])
+        self.assertIn("webp", data["image_to_image"])
+        self.assertIn("avif", data["image_to_image"])
+        self.assertNotIn("docx", data["output_formats"])
+        self.assertNotIn("heic", data["output_formats"])
+
+    def test_real_png_to_webp_image_conversion(self):
+        from PIL import Image
+        before = appmod._conversion_count()
+        sample = appmod.UPLOAD_DIR / f"test-image-{__import__('uuid').uuid4().hex}.png"
+        image = Image.new("RGB", (16, 12), (255, 20, 80))
+        image.save(sample, "PNG")
+        try:
+            with sample.open("rb") as stream:
+                response = self.client.post("/api/convert", data={"output_format":"webp", "file":(stream,"sample.png")}, content_type="multipart/form-data")
+            self.assertEqual(response.status_code, 200, response.get_data(as_text=True))
+            job_id = response.get_json()["job_id"]
+            with self.client.get(f"/download/{job_id}") as download:
+                self.assertEqual(download.status_code, 200)
+                self.assertTrue(download.data.startswith(b"RIFF"))
+            self.assertEqual(self.client.get("/api/stats").get_json()["completed_conversions"], appmod._conversion_count())
+            self.assertEqual(appmod._conversion_count(), before + 1)
+        finally:
+            sample.unlink(missing_ok=True)
+
+    def test_media_and_image_families_cannot_be_mixed(self):
+        response = self.client.post("/api/convert", data={"output_format":"mp3", "file":(io.BytesIO(b"not image"),"sample.png")}, content_type="multipart/form-data")
+        self.assertEqual(response.status_code, 415)
+
+    def test_stats_endpoint_starts_at_integer_counter(self):
+        response = self.client.get("/api/stats")
+        self.assertEqual(response.status_code, 200)
+        self.assertIsInstance(response.get_json()["completed_conversions"], int)
+        self.assertIn("persistent", response.get_json())
+
+
     def test_real_mp4_to_mp3_conversion_download_and_cleanup(self):
         ffmpeg = FFMPEG_BIN
         sample = appmod.UPLOAD_DIR / "tiny-test-input.mp4"
